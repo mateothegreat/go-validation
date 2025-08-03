@@ -366,11 +366,25 @@ func isPhone(fl FieldLevel) bool {
 // isEqField validates that field equals another field
 func isEqField(fl FieldLevel) bool {
 	field, kind, found := fl.GetStructFieldOK()
-	if !found || kind != fl.Field().Kind() {
+	if !found {
+		// Debug: field not found
+		return false
+	}
+	if kind != fl.Field().Kind() {
+		// Debug: kind mismatch
 		return false
 	}
 	
-	return field.Interface() == fl.Field().Interface()
+	currentValue := fl.Field().Interface()
+	targetValue := field.Interface()
+	result := currentValue == targetValue
+	
+	// Debug output - remove this later
+	if !result {
+		// Add debug info but don't print to avoid breaking tests
+	}
+	
+	return result
 }
 
 // isNeField validates that field does not equal another field
@@ -422,13 +436,15 @@ func isLteField(fl FieldLevel) bool {
 
 // isRequiredIf validates that field is required if another field has a specific value
 func isRequiredIf(fl FieldLevel) bool {
-	params, err := ParseParam(fl.Param())
-	if err != nil || len(params) < 2 {
+	param := fl.Param()
+	// For required_if, the format is "FieldName value", so split by space
+	parts := strings.SplitN(param, " ", 2)
+	if len(parts) < 2 {
 		return false
 	}
 	
-	fieldName := params[0]
-	expectedValue := params[1]
+	fieldName := strings.TrimSpace(parts[0])
+	expectedValue := strings.TrimSpace(parts[1])
 	
 	field, _, found := fl.(*fieldLevel).getStructFieldOK(fl.Parent(), fieldName)
 	if !found {

@@ -1,0 +1,11 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mateothegreat/go-validation
+cpu: Apple M1 Max
+BenchmarkCrossFieldValidation-10               	  452052	      2613 ns/op	    2672 B/op	      35 allocs/op
+BenchmarkCrossFieldValidation_EqField-10       	 2336232	       544.3 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCrossFieldValidation_GtField-10       	 2294496	       524.3 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCrossFieldValidation_RequiredIf-10    	 1719758	       687.6 ns/op	     680 B/op	      11 allocs/op
+BenchmarkCrossFieldValidation_Failures-10      	  311726	      3886 ns/op	    4305 B/op	      54 allocs/op
+PASS
+ok  	github.com/mateothegreat/go-validation	8.046s

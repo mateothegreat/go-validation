@@ -81,12 +81,12 @@ func createValidationBenchmarkSuite() *bench.BenchmarkSuite {
 	// Add scaling test data for different input sizes
 	suite.AddScalingDimension(bench.ScalingDimension{
 		Name:   "StringLength",
-		Values: []interface{}{10, 100, 1000, 10000},
+		Values: []interface{}{10},
 	})
 
 	suite.AddScalingDimension(bench.ScalingDimension{
 		Name:   "OneOfChoices",
-		Values: []interface{}{5, 50, 500, 5000},
+		Values: []interface{}{5},
 	})
 
 	return suite

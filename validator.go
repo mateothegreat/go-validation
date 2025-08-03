@@ -144,7 +144,7 @@ func (v *Validator) Var(field interface{}, tag string) error {
 	val := reflect.ValueOf(field)
 	collector := NewErrorCollector()
 	
-	v.validateField(val, "field", tag, collector)
+	v.validateField(val, reflect.Value{}, "field", tag, collector)
 	
 	if collector.HasErrors() {
 		return collector.Errors()
@@ -214,7 +214,12 @@ func (v *Validator) validateStruct(val reflect.Value, typ reflect.Type, namespac
 		if strings.Contains(tag, "dive") {
 			v.validateDive(fieldVal, fullPath, tag, collector)
 		} else {
-			v.validateField(fieldVal, fieldName, tag, collector)
+			v.validateField(fieldVal, val, fieldName, tag, collector)
+			
+			// Also validate nested struct if field is a struct type
+			if fieldVal.Kind() == reflect.Struct || (fieldVal.Kind() == reflect.Ptr && fieldVal.Type().Elem().Kind() == reflect.Struct) {
+				v.validateNestedStruct(fieldVal, fullPath, collector)
+			}
 		}
 		
 		if collector.ShouldStop() {
@@ -224,12 +229,67 @@ func (v *Validator) validateStruct(val reflect.Value, typ reflect.Type, namespac
 }
 
 // validateField validates a single field with its validation rules
-func (v *Validator) validateField(val reflect.Value, fieldName, tag string, collector *ErrorCollector) {
+func (v *Validator) validateField(val reflect.Value, parent reflect.Value, fieldName, tag string, collector *ErrorCollector) {
 	rules := strings.Split(tag, ",")
 	
+	// Check if omitempty is present
+	hasOmitEmpty := false
+	for _, rule := range rules {
+		if strings.TrimSpace(rule) == "omitempty" {
+			hasOmitEmpty = true
+			break
+		}
+	}
+	
+	// If omitempty is present and field has no value, only validate required-like rules
+	if hasOmitEmpty && !HasValue(&fieldLevel{
+		validator: v,
+		top:       parent,
+		parent:    parent,
+		field:     val,
+		fieldName: fieldName,
+	}) {
+		// Only process required-like rules for empty fields with omitempty
+		for _, rule := range rules {
+			rule = strings.TrimSpace(rule)
+			if rule == "" {
+				continue
+			}
+			
+			parts := strings.SplitN(rule, "=", 2)
+			ruleName := parts[0]
+			
+			// Only validate required-like rules
+			if strings.HasPrefix(ruleName, "required") {
+				var param string
+				if len(parts) > 1 {
+					param = parts[1]
+				}
+				
+				fl := &fieldLevel{
+					validator:   v,
+					top:         parent,
+					parent:      parent,
+					field:       val,
+					fieldName:   fieldName,
+					param:       param,
+					tag:         ruleName,
+				}
+				
+				if customFn, exists := v.customRules[ruleName]; exists {
+					if !customFn(fl) {
+						collector.AddFieldErrorWithParam(fieldName, ruleName, param, 
+							v.getErrorMessage(ruleName, fieldName, param), val.Interface())
+					}
+				}
+			}
+		}
+		return
+	}
+
 	for _, rule := range rules {
 		rule = strings.TrimSpace(rule)
-		if rule == "" {
+		if rule == "" || rule == "omitempty" {
 			continue
 		}
 		
@@ -251,8 +311,8 @@ func (v *Validator) validateField(val reflect.Value, fieldName, tag string, coll
 		// Create field level context
 		fl := &fieldLevel{
 			validator:   v,
-			top:         val,
-			parent:      val,
+			top:         parent,
+			parent:      parent,
 			field:       val,
 			fieldName:   fieldName,
 			param:       param,
@@ -310,7 +370,7 @@ func (v *Validator) validateDive(val reflect.Value, namespace, tag string, colle
 			elemPath := fmt.Sprintf("%s[%d]", namespace, i)
 			
 			if tag != "" {
-				v.validateField(elemVal, elemPath, tag, collector)
+				v.validateField(elemVal, reflect.Value{}, elemPath, tag, collector)
 			} else if elemVal.Kind() == reflect.Struct {
 				v.validateNestedStruct(elemVal, elemPath, collector)
 			}
@@ -321,7 +381,7 @@ func (v *Validator) validateDive(val reflect.Value, namespace, tag string, colle
 			elemPath := fmt.Sprintf("%s[%v]", namespace, key.Interface())
 			
 			if tag != "" {
-				v.validateField(elemVal, elemPath, tag, collector)
+				v.validateField(elemVal, reflect.Value{}, elemPath, tag, collector)
 			} else if elemVal.Kind() == reflect.Struct {
 				v.validateNestedStruct(elemVal, elemPath, collector)
 			}
