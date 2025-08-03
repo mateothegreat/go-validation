@@ -3,456 +3,395 @@ package validation
 import (
 	"fmt"
 	"reflect"
-	"regexp"
-	"strconv"
 	"strings"
-
-	"github.com/mateothegreat/go-config/errors"
+	"sync"
 )
 
-// UnifiedValidator provides validation using multiple strategies
-type UnifiedValidator struct {
-	config             ValidatorConfig
-	detector           *ValidationDetector
-	generatedRegistry  GeneratedValidatorRegistry
-	reflectionRegistry ValidatorRegistry
-	fastValidator      TypedValidator
+// Validator provides high-level validation functionality
+type Validator struct {
+	tagName       string
+	rules         map[string][]ValidationFunc
+	customRules   map[string]ValidationFunc
+	structRules   map[reflect.Type]StructLevelValidationFunc
+	fieldNameFunc FieldNameFunc
+	errorCollector *ErrorCollector
+	config        ValidatorConfig
+	mu            sync.RWMutex
 }
 
-// NewUnifiedValidator creates a new unified validator
-func NewUnifiedValidator(config ValidatorConfig) *UnifiedValidator {
-	detector := NewValidationDetector(config)
-	registry := NewValidatorRegistry()
-	registerBuiltInValidators(registry)
+// ValidationFunc defines a validation function signature
+type ValidationFunc func(fl FieldLevel) bool
 
-	return &UnifiedValidator{
-		config:             config,
-		detector:           detector,
-		generatedRegistry:  globalGeneratedRegistry,
-		reflectionRegistry: registry,
-		fastValidator:      NewFastValidator(),
+// StructLevelValidationFunc defines a struct-level validation function
+type StructLevelValidationFunc func(sl StructLevel)
+
+// FieldNameFunc defines a function to get field names for errors
+type FieldNameFunc func(fld reflect.StructField) string
+
+// ValidatorConfig holds configuration for the validator
+type ValidatorConfig struct {
+	TagName      string // Default: "validate"
+	FailFast     bool   // Stop on first error
+	IgnoreFields []string // Fields to ignore during validation
+}
+
+// DefaultValidatorConfig returns default configuration
+func DefaultValidatorConfig() ValidatorConfig {
+	return ValidatorConfig{
+		TagName:  "validate",
+		FailFast: false,
 	}
 }
 
-// Validate validates the given data using the most appropriate strategy
-func (uv *UnifiedValidator) Validate(data any) error {
-	strategy := uv.detector.DetectStrategy(data)
+// New creates a new validator with default configuration
+func New() *Validator {
+	return NewWithConfig(DefaultValidatorConfig())
+}
 
-	switch strategy {
-	case StrategyGenerated:
-		return uv.validateWithGenerated(data)
-	case StrategyReflection:
-		return uv.validateWithReflection(data)
-	case StrategyFast:
-		return uv.validateWithFast(data)
-	default:
-		return uv.validateWithAuto(data)
+// NewWithConfig creates a new validator with custom configuration
+func NewWithConfig(config ValidatorConfig) *Validator {
+	v := &Validator{
+		tagName:       config.TagName,
+		rules:         make(map[string][]ValidationFunc),
+		customRules:   make(map[string]ValidationFunc),
+		structRules:   make(map[reflect.Type]StructLevelValidationFunc),
+		config:        config,
+		fieldNameFunc: defaultFieldNameFunc,
+	}
+	
+	// Register built-in validation rules
+	v.registerBuiltInRules()
+	
+	return v
+}
+
+// Global validator instance for package-level functions
+var defaultValidator = New()
+
+// SetTagName sets the tag name for validation (default: "validate")
+func (v *Validator) SetTagName(name string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.tagName = name
+}
+
+// SetFieldNameFunc sets the function to use for getting field names
+func (v *Validator) SetFieldNameFunc(fn FieldNameFunc) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.fieldNameFunc = fn
+}
+
+// RegisterValidation registers a custom validation function
+func (v *Validator) RegisterValidation(tag string, fn ValidationFunc) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	
+	if tag == "" {
+		return fmt.Errorf("validation tag cannot be empty")
+	}
+	
+	v.customRules[tag] = fn
+	return nil
+}
+
+// RegisterStructValidation registers a struct-level validation function
+func (v *Validator) RegisterStructValidation(fn StructLevelValidationFunc, types ...interface{}) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	
+	for _, t := range types {
+		v.structRules[reflect.TypeOf(t)] = fn
 	}
 }
 
-// validateWithGenerated uses generated validation code
-func (uv *UnifiedValidator) validateWithGenerated(data any) error {
-	// Try interface first
-	if gv, ok := data.(GeneratedValidator); ok {
-		return gv.Validate()
+// Struct validates a struct based on its tags
+func (v *Validator) Struct(s interface{}) error {
+	if s == nil {
+		return nil
 	}
-
-	// Try registry
-	return uv.generatedRegistry.ValidateWithGenerated(data)
-}
-
-// validateWithReflection uses reflection-based validation
-func (uv *UnifiedValidator) validateWithReflection(data any) error {
-	val := reflect.ValueOf(data)
+	
+	val := reflect.ValueOf(s)
 	if val.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			return nil
+		}
 		val = val.Elem()
 	}
-
+	
 	if val.Kind() != reflect.Struct {
-		return fmt.Errorf("validation target must be a struct, got %v", val.Kind())
+		return fmt.Errorf("validation can only be performed on structs, got %s", val.Kind())
 	}
-
-	typ := val.Type()
+	
 	collector := NewErrorCollector()
-
-	for i := 0; i < val.NumField(); i++ {
-		field := typ.Field(i)
-		fieldValue := val.Field(i)
-
-		// Skip unexported fields
-		if !fieldValue.CanInterface() {
-			continue
-		}
-
-		validateTag := field.Tag.Get("validate")
-		if validateTag == "" {
-			// For nested structs (including pointer to struct), recursively validate
-			if field.Type.Kind() == reflect.Struct {
-				if err := uv.validateWithReflection(fieldValue.Interface()); err != nil {
-					collector.Add(field.Name, err.Error())
-				}
-			} else if field.Type.Kind() == reflect.Ptr && !fieldValue.IsNil() && field.Type.Elem().Kind() == reflect.Struct {
-				if err := uv.validateWithReflection(fieldValue.Interface()); err != nil {
-					collector.Add(field.Name, err.Error())
-				}
-			}
-			continue
-		}
-
-		rules := parseValidationRules(validateTag)
-		uv.validateFieldWithReflection(field.Name, fieldValue, rules, collector)
-
-		// For nested structs (including pointer to struct), recursively validate
-		if field.Type.Kind() == reflect.Struct {
-			if err := uv.validateWithReflection(fieldValue.Interface()); err != nil {
-				collector.Add(field.Name, err.Error())
-			}
-		} else if field.Type.Kind() == reflect.Ptr && !fieldValue.IsNil() && field.Type.Elem().Kind() == reflect.Struct {
-			if err := uv.validateWithReflection(fieldValue.Interface()); err != nil {
-				collector.Add(field.Name, err.Error())
-			}
-		}
-
-		if uv.config.FailFast && collector.HasErrors() {
-			break
-		}
-	}
-
+	collector.SetFailFast(v.config.FailFast)
+	
+	v.validateStruct(val, val.Type(), "", collector)
+	
 	if collector.HasErrors() {
 		return collector.Errors()
 	}
+	
 	return nil
 }
 
-// validateWithFast uses type-specific fast validation
-func (uv *UnifiedValidator) validateWithFast(data any) error {
-	val := reflect.ValueOf(data)
+// Var validates a single variable against a validation tag
+func (v *Validator) Var(field interface{}, tag string) error {
+	if tag == "" {
+		return nil
+	}
+	
+	val := reflect.ValueOf(field)
+	collector := NewErrorCollector()
+	
+	v.validateField(val, "field", tag, collector)
+	
+	if collector.HasErrors() {
+		return collector.Errors()
+	}
+	
+	return nil
+}
+
+// VarWithValue validates a field with another value for comparison
+func (v *Validator) VarWithValue(field interface{}, other interface{}, tag string) error {
+	// Implementation for cross-field validation
+	// This would be used for rules like "eqfield", "nefield", etc.
+	return v.Var(field, tag)
+}
+
+// validateStruct validates a struct recursively
+func (v *Validator) validateStruct(val reflect.Value, typ reflect.Type, namespace string, collector *ErrorCollector) {
+	// Check for struct-level validation
+	if structFn, exists := v.structRules[typ]; exists {
+		sl := &structLevel{
+			validator: v,
+			top:       val,
+			current:   val,
+			namespace: namespace,
+		}
+		structFn(sl)
+		if sl.errors.HasErrors() {
+			collector.Merge(sl.errors)
+		}
+	}
+	
+	// Validate individual fields
+	for i := 0; i < val.NumField(); i++ {
+		fieldVal := val.Field(i)
+		fieldType := typ.Field(i)
+		
+		// Skip unexported fields
+		if !fieldVal.CanInterface() {
+			continue
+		}
+		
+		// Skip ignored fields
+		if v.isIgnoredField(fieldType.Name) {
+			continue
+		}
+		
+		fieldName := v.fieldNameFunc(fieldType)
+		fullPath := fieldName
+		if namespace != "" {
+			fullPath = namespace + "." + fieldName
+		}
+		
+		// Get validation tag
+		tag := fieldType.Tag.Get(v.tagName)
+		if tag == "" || tag == "-" {
+			// Handle nested structs even without validation tags
+			if fieldVal.Kind() == reflect.Struct || (fieldVal.Kind() == reflect.Ptr && fieldVal.Type().Elem().Kind() == reflect.Struct) {
+				v.validateNestedStruct(fieldVal, fullPath, collector)
+			}
+			continue
+		}
+		
+		// Set namespace for error collection
+		collector.SetNamespace(namespace)
+		
+		// Handle nested struct validation
+		if strings.Contains(tag, "dive") {
+			v.validateDive(fieldVal, fullPath, tag, collector)
+		} else {
+			v.validateField(fieldVal, fieldName, tag, collector)
+		}
+		
+		if collector.ShouldStop() {
+			return
+		}
+	}
+}
+
+// validateField validates a single field with its validation rules
+func (v *Validator) validateField(val reflect.Value, fieldName, tag string, collector *ErrorCollector) {
+	rules := strings.Split(tag, ",")
+	
+	for _, rule := range rules {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+		
+		// Parse rule and parameters
+		parts := strings.SplitN(rule, "=", 2)
+		ruleName := parts[0]
+		var param string
+		if len(parts) > 1 {
+			param = parts[1]
+		}
+		
+		// Skip validation if field is nil and rule is not "required"
+		if !val.IsValid() || (val.Kind() == reflect.Ptr && val.IsNil()) {
+			if ruleName != "required" {
+				continue
+			}
+		}
+		
+		// Create field level context
+		fl := &fieldLevel{
+			validator:   v,
+			top:         val,
+			parent:      val,
+			field:       val,
+			fieldName:   fieldName,
+			param:       param,
+			tag:         ruleName,
+		}
+		
+		// Check custom rules first
+		if customFn, exists := v.customRules[ruleName]; exists {
+			if !customFn(fl) {
+				collector.AddFieldErrorWithParam(fieldName, ruleName, param, 
+					v.getErrorMessage(ruleName, fieldName, param), val.Interface())
+			}
+			continue
+		}
+		
+		// Check built-in rules
+		if err := v.validateBuiltInRule(fl); err != nil {
+			if validationErr, ok := err.(ValidationError); ok {
+				collector.Add(validationErr)
+			} else {
+				collector.AddFieldError(fieldName, ruleName, err.Error())
+			}
+		}
+		
+		if collector.ShouldStop() {
+			return
+		}
+	}
+}
+
+// validateNestedStruct handles validation of nested structs
+func (v *Validator) validateNestedStruct(val reflect.Value, namespace string, collector *ErrorCollector) {
 	if val.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			return
+		}
 		val = val.Elem()
 	}
-
-	if val.Kind() != reflect.Struct {
-		return fmt.Errorf("validation target must be a struct, got %v", val.Kind())
+	
+	if val.Kind() == reflect.Struct {
+		v.validateStruct(val, val.Type(), namespace, collector)
 	}
-
-	typ := val.Type()
-	var allErrors []string
-
-	for i := 0; i < val.NumField(); i++ {
-		field := typ.Field(i)
-		fieldValue := val.Field(i)
-
-		if !fieldValue.CanInterface() {
-			continue
-		}
-
-		validateTag := field.Tag.Get("validate")
-		if validateTag == "" {
-			// For nested structs (including pointer to struct), recursively validate
-			if field.Type.Kind() == reflect.Struct {
-				if err := uv.validateWithFast(fieldValue.Interface()); err != nil {
-					allErrors = append(allErrors, fmt.Sprintf("%s: %s", field.Name, err.Error()))
-				}
-			} else if field.Type.Kind() == reflect.Ptr && !fieldValue.IsNil() && field.Type.Elem().Kind() == reflect.Struct {
-				if err := uv.validateWithFast(fieldValue.Interface()); err != nil {
-					allErrors = append(allErrors, fmt.Sprintf("%s: %s", field.Name, err.Error()))
-				}
-			}
-			continue
-		}
-
-		rules := parseValidationRules(validateTag)
-		fieldErrors := uv.validateFieldByType(field.Name, fieldValue, rules)
-		allErrors = append(allErrors, fieldErrors...)
-
-		// For nested structs (including pointer to struct), recursively validate
-		if field.Type.Kind() == reflect.Struct {
-			if err := uv.validateWithFast(fieldValue.Interface()); err != nil {
-				allErrors = append(allErrors, fmt.Sprintf("%s: %s", field.Name, err.Error()))
-			}
-		} else if field.Type.Kind() == reflect.Ptr && !fieldValue.IsNil() && field.Type.Elem().Kind() == reflect.Struct {
-			if err := uv.validateWithFast(fieldValue.Interface()); err != nil {
-				allErrors = append(allErrors, fmt.Sprintf("%s: %s", field.Name, err.Error()))
-			}
-		}
-
-		if uv.config.FailFast && len(allErrors) > 0 {
-			break
-		}
-	}
-
-	if len(allErrors) > 0 {
-		var validationErrors errors.ValidationErrors
-		for _, errMsg := range allErrors {
-			validationErrors = append(validationErrors, errors.ValidationError{
-				Message: errMsg,
-			})
-		}
-		return validationErrors
-	}
-	return nil
 }
 
-// validateWithAuto automatically chooses the best strategy
-func (uv *UnifiedValidator) validateWithAuto(data any) error {
-	strategy := uv.detector.DetectStrategy(data)
+// validateDive handles "dive" validation for slices, arrays, and maps
+func (v *Validator) validateDive(val reflect.Value, namespace, tag string, collector *ErrorCollector) {
+	// Remove "dive" from tag to get rules for elements
+	tag = strings.ReplaceAll(tag, "dive", "")
+	tag = strings.TrimSpace(strings.Trim(tag, ","))
+	
+	switch val.Kind() {
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < val.Len(); i++ {
+			elemVal := val.Index(i)
+			elemPath := fmt.Sprintf("%s[%d]", namespace, i)
+			
+			if tag != "" {
+				v.validateField(elemVal, elemPath, tag, collector)
+			} else if elemVal.Kind() == reflect.Struct {
+				v.validateNestedStruct(elemVal, elemPath, collector)
+			}
+		}
+	case reflect.Map:
+		for _, key := range val.MapKeys() {
+			elemVal := val.MapIndex(key)
+			elemPath := fmt.Sprintf("%s[%v]", namespace, key.Interface())
+			
+			if tag != "" {
+				v.validateField(elemVal, elemPath, tag, collector)
+			} else if elemVal.Kind() == reflect.Struct {
+				v.validateNestedStruct(elemVal, elemPath, collector)
+			}
+		}
+	}
+}
 
-	// Use the detected strategy
-	switch strategy {
-	case StrategyGenerated:
-		return uv.validateWithGenerated(data)
-	case StrategyReflection:
-		return uv.validateWithReflection(data)
-	case StrategyFast:
-		return uv.validateWithFast(data)
+// isIgnoredField checks if a field should be ignored
+func (v *Validator) isIgnoredField(fieldName string) bool {
+	for _, ignored := range v.config.IgnoreFields {
+		if fieldName == ignored {
+			return true
+		}
+	}
+	return false
+}
+
+// getErrorMessage returns an appropriate error message for a validation rule
+func (v *Validator) getErrorMessage(rule, field, param string) string {
+	switch rule {
+	case "required":
+		return fmt.Sprintf(ErrorMsgRequired, field)
+	case "min":
+		return fmt.Sprintf(ErrorMsgMin, field, param)
+	case "max":
+		return fmt.Sprintf(ErrorMsgMax, field, param)
+	case "len":
+		return fmt.Sprintf(ErrorMsgLength, field, param)
+	case "email":
+		return fmt.Sprintf(ErrorMsgEmail, field)
+	case "url":
+		return fmt.Sprintf(ErrorMsgURL, field)
+	case "oneof":
+		return fmt.Sprintf(ErrorMsgOneOf, field, param)
 	default:
-		return uv.validateWithReflection(data)
+		return fmt.Sprintf("field '%s' failed validation '%s'", field, rule)
 	}
 }
 
-// validateFieldWithReflection validates a field using reflection-based validators
-func (uv *UnifiedValidator) validateFieldWithReflection(fieldName string, fieldValue reflect.Value, rules map[string]string, collector ErrorCollector) {
-	for ruleName, ruleValue := range rules {
-		if validator, exists := uv.reflectionRegistry.GetValidator(ruleName); exists {
-			if err := validator(fieldName, fieldValue, ruleValue); err != nil {
-				collector.Add(fieldName, err.Error())
-				if uv.config.FailFast {
-					return
-				}
-			}
-		} else if !uv.config.AllowUnknownTags {
-			collector.Add(fieldName, fmt.Sprintf("unknown validation rule: %s", ruleName))
+// defaultFieldNameFunc returns the field name from struct field
+func defaultFieldNameFunc(fld reflect.StructField) string {
+	// Check for json tag first
+	if jsonTag := fld.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
+		if name := strings.Split(jsonTag, ",")[0]; name != "" {
+			return name
 		}
 	}
+	
+	// Use field name
+	return fld.Name
 }
 
-// validateFieldByType validates a field using type-specific fast validation
-func (uv *UnifiedValidator) validateFieldByType(fieldName string, fieldValue reflect.Value, rules map[string]string) []string {
-	switch fieldValue.Kind() {
-	case reflect.String:
-		return uv.fastValidator.ValidateString(fieldName, fieldValue.String(), rules)
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return uv.fastValidator.ValidateInt(fieldName, int(fieldValue.Int()), rules)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return uv.fastValidator.ValidateInt(fieldName, int(fieldValue.Uint()), rules)
-	case reflect.Float32, reflect.Float64:
-		return uv.fastValidator.ValidateFloat(fieldName, fieldValue.Float(), rules)
-	case reflect.Bool:
-		return uv.fastValidator.ValidateBool(fieldName, fieldValue.Bool(), rules)
-	default:
-		// For unsupported types, fall back to string representation
-		return uv.fastValidator.ValidateString(fieldName, fmt.Sprintf("%v", fieldValue.Interface()), rules)
-	}
+// Package-level convenience functions
+
+// Struct validates a struct using the default validator
+func Struct(s interface{}) error {
+	return defaultValidator.Struct(s)
 }
 
-// RegisterValidator registers a new reflection-based validator
-func (uv *UnifiedValidator) RegisterValidator(name string, validator FieldValidator) {
-	uv.reflectionRegistry.RegisterValidator(name, validator)
+// Var validates a variable using the default validator
+func Var(field interface{}, tag string) error {
+	return defaultValidator.Var(field, tag)
 }
 
-// GetValidationInfo returns information about validation capabilities for the given data
-func (uv *UnifiedValidator) GetValidationInfo(data any) ValidationInfo {
-	return uv.detector.GetValidationInfo(data)
+// RegisterValidation registers a validation function on the default validator
+func RegisterValidation(tag string, fn ValidationFunc) error {
+	return defaultValidator.RegisterValidation(tag, fn)
 }
 
-// parseValidationRules parses validation tag string into rules map
-func parseValidationRules(tag string) map[string]string {
-	rules := make(map[string]string)
-	parts := strings.Split(tag, ",")
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-
-		if strings.Contains(part, "=") {
-			kv := strings.SplitN(part, "=", 2)
-			rules[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-		} else {
-			rules[part] = ""
-		}
-	}
-
-	return rules
-}
-
-// registerBuiltInValidators registers the standard validation rules
-func registerBuiltInValidators(registry ValidatorRegistry) {
-	// Required validator
-	registry.RegisterValidator("required", func(fieldName string, value reflect.Value, rule string) error {
-		if !value.IsValid() {
-			return fmt.Errorf("field '%s' is required", fieldName)
-		}
-
-		switch value.Kind() {
-		case reflect.String:
-			if value.String() == "" {
-				return fmt.Errorf("field '%s' is required", fieldName)
-			}
-		case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Chan:
-			if value.IsNil() {
-				return fmt.Errorf("field '%s' is required", fieldName)
-			}
-			// For pointers to structs, we also need to validate that the struct itself is valid
-			if value.Kind() == reflect.Ptr && !value.IsNil() && value.Elem().Kind() == reflect.Struct {
-				// The pointer is not nil, which satisfies the "required" constraint
-				// The actual struct validation will be handled by recursive validation
-				return nil
-			}
-		case reflect.Array:
-			// Arrays are never nil, but we can check if all elements are zero
-			if value.Len() == 0 {
-				return fmt.Errorf("field '%s' is required", fieldName)
-			}
-		}
-		return nil
-	})
-
-	// MinLen validator
-	registry.RegisterValidator("minlen", func(fieldName string, value reflect.Value, rule string) error {
-		minLen, err := strconv.Atoi(rule)
-		if err != nil {
-			return fmt.Errorf("invalid minlen rule '%s' for field '%s'", rule, fieldName)
-		}
-
-		var length int
-		switch value.Kind() {
-		case reflect.String:
-			length = len(value.String())
-		case reflect.Slice, reflect.Array, reflect.Map, reflect.Chan:
-			length = value.Len()
-		default:
-			return fmt.Errorf("minlen validation not supported for type %v", value.Kind())
-		}
-
-		if length < minLen {
-			return fmt.Errorf("field '%s' must be at least %d characters/elements long", fieldName, minLen)
-		}
-		return nil
-	})
-
-	// MaxLen validator
-	registry.RegisterValidator("maxlen", func(fieldName string, value reflect.Value, rule string) error {
-		maxLen, err := strconv.Atoi(rule)
-		if err != nil {
-			return fmt.Errorf("invalid maxlen rule '%s' for field '%s'", rule, fieldName)
-		}
-
-		var length int
-		switch value.Kind() {
-		case reflect.String:
-			length = len(value.String())
-		case reflect.Slice, reflect.Array, reflect.Map, reflect.Chan:
-			length = value.Len()
-		default:
-			return fmt.Errorf("maxlen validation not supported for type %v", value.Kind())
-		}
-
-		if length > maxLen {
-			return fmt.Errorf("field '%s' must be at most %d characters/elements long", fieldName, maxLen)
-		}
-		return nil
-	})
-
-	// Email validator
-	registry.RegisterValidator("email", func(fieldName string, value reflect.Value, rule string) error {
-		if value.Kind() != reflect.String {
-			return fmt.Errorf("email validation only supports string fields")
-		}
-
-		email := value.String()
-		emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
-		if !emailRegex.MatchString(email) {
-			return fmt.Errorf("field '%s' must be a valid email address", fieldName)
-		}
-		return nil
-	})
-
-	// Min validator for numeric fields
-	registry.RegisterValidator("min", func(fieldName string, value reflect.Value, rule string) error {
-		minVal, err := strconv.ParseFloat(rule, 64)
-		if err != nil {
-			return fmt.Errorf("invalid min rule '%s' for field '%s'", rule, fieldName)
-		}
-
-		var numVal float64
-		switch value.Kind() {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			numVal = float64(value.Int())
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			numVal = float64(value.Uint())
-		case reflect.Float32, reflect.Float64:
-			numVal = value.Float()
-		default:
-			return fmt.Errorf("min validation not supported for type %v", value.Kind())
-		}
-
-		if numVal < minVal {
-			return fmt.Errorf("field '%s' must be at least %g", fieldName, minVal)
-		}
-		return nil
-	})
-
-	// Max validator for numeric fields
-	registry.RegisterValidator("max", func(fieldName string, value reflect.Value, rule string) error {
-		maxVal, err := strconv.ParseFloat(rule, 64)
-		if err != nil {
-			return fmt.Errorf("invalid max rule '%s' for field '%s'", rule, fieldName)
-		}
-
-		var numVal float64
-		switch value.Kind() {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			numVal = float64(value.Int())
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			numVal = float64(value.Uint())
-		case reflect.Float32, reflect.Float64:
-			numVal = value.Float()
-		default:
-			return fmt.Errorf("max validation not supported for type %v", value.Kind())
-		}
-
-		if numVal > maxVal {
-			return fmt.Errorf("field '%s' must be at most %g", fieldName, maxVal)
-		}
-		return nil
-	})
-
-	// OneOf validator
-	registry.RegisterValidator("oneof", func(fieldName string, value reflect.Value, rule string) error {
-		if value.Kind() != reflect.String {
-			return fmt.Errorf("oneof validation only supports string fields")
-		}
-
-		stringVal := value.String()
-		options := strings.Split(rule, "|")
-		
-		for _, option := range options {
-			option = strings.TrimSpace(option)
-			if stringVal == option {
-				return nil
-			}
-		}
-
-		return fmt.Errorf("field '%s' must be one of [%s]", fieldName, strings.Join(options, ", "))
-	})
-
-	// Regex validator
-	registry.RegisterValidator("regex", func(fieldName string, value reflect.Value, rule string) error {
-		if value.Kind() != reflect.String {
-			return fmt.Errorf("regex validation only supports string fields")
-		}
-
-		stringVal := value.String()
-		regex, err := regexp.Compile(rule)
-		if err != nil {
-			return fmt.Errorf("invalid regex pattern '%s' for field '%s': %v", rule, fieldName, err)
-		}
-
-		if !regex.MatchString(stringVal) {
-			return fmt.Errorf("field '%s' does not match pattern '%s'", fieldName, rule)
-		}
-		return nil
-	})
+// RegisterStructValidation registers a struct validation function on the default validator
+func RegisterStructValidation(fn StructLevelValidationFunc, types ...interface{}) {
+	defaultValidator.RegisterStructValidation(fn, types...)
 }
